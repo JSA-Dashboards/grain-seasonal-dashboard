@@ -624,13 +624,14 @@ def _make_seasonal_overlay(
     month_names = [n for n, m in zip(_ALL_MONTH_NAMES, range(1, 13)) if m <= end_month]
     x_max = _MONTH_END_DOY[end_month - 1] + 5
 
+    layout = _layout_base(title, height=height)
+    layout["margin"] = dict(l=70, r=140, t=45, b=50)  # wider right margin for the H/L/Jan-1 annotations
     fig.update_layout(
-        **_layout_base(title, height=height),
+        **layout,
         xaxis=dict(title="Month", tickvals=month_doys, ticktext=month_names,
                    gridcolor=_BORDER, color=_MUTED, zeroline=False, range=[1, x_max]),
         yaxis=dict(title="Price ($/bu)", gridcolor=_BORDER, color=_MUTED,
                    zeroline=False, tickprefix="$", range=y_range, autorange=False),
-        margin=dict(l=70, r=140, t=45, b=50),
     )
     return fig
 
