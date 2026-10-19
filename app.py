@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import stocks_use
 import trend_board
 from ai_chat import run_chat
 from hl_model import render_hl_tab
@@ -517,6 +518,78 @@ def _add_seasonal_overlay(fig, by_dte: dict[str, pd.Series], window_days: int,
         ))
 
 
+@st.cache_data(ttl="24h", show_spinner="Loading USDA stocks/use…")
+def load_stocks_to_use(product_code: str) -> dict[int, float]:
+    """US stocks/use ratio by marketing year, from USDA FAS PSD (whole history in one
+    download) with the WASDE CSV as fallback. Long TTL — it only moves on WASDE release day."""
+    return stocks_use.fetch_stocks_to_use(product_code, date.today().year, 100)
+
+
+def similar_su_controls(code: str, key: str, candidate_years: list[int], near_expiry: date) -> list[int]:
+    """Toggle and tolerance that auto-highlight prior years whose US stocks/use ratio was
+    close to the current marketing year's. Returns the contract years to emphasise.
+
+    Similarity is judged on the marketing year the contract trades against, which is not its
+    calendar year: Dec '25 through Sep '26 corn all trade against the 2025/26 carryout.
+    `near_expiry` therefore drives the lookup, and matches are mapped back to contract years
+    so they line up with the overlaid lines."""
+    if not stocks_use.has_stocks_use(code):
+        return []
+    wheat_note = (" Chicago and KC wheat both use USDA's all-wheat balance sheet."
+                  if code in ("ZW", "KE") else "")
+    row = st.container(horizontal=True, vertical_alignment="bottom")
+    with row:
+        similar_on = st.toggle(
+            "Similar S/U years", value=True, key=f"simsu_{key}",
+            help="Auto-highlight prior years whose US stocks/use ratio was within the tolerance "
+                 "beside it of the current marketing year's. US balance sheets come from USDA "
+                 "FAS PSD, which covers every year on these charts; if PSD is unreachable it "
+                 "falls back to USDA's WASDE CSV, which only reaches 2019." + wheat_note,
+        )
+        if similar_on:
+            # Each market's ratio lives in its own range (meal spends years inside a fifth of a
+            # point), so the default and step follow the market.
+            tol_default = stocks_use.default_tolerance(code)
+            similar_tol = st.number_input(
+                "± pts", min_value=0.01, max_value=10.0, value=tol_default,
+                step=max(round(tol_default / 4, 2), 0.01),
+                format="%.2f" if tol_default < 0.5 else "%.1f",
+                key=f"simtol_{key}", width=100,
+            )
+    if not similar_on:
+        return []
+
+    # Meal lives inside a fifth of a point, so one decimal would print every year as "0.7%";
+    # show as many as the tolerance can distinguish.
+    ratio_fmt = ".2f" if similar_tol < 0.5 else ".1f"
+    stu = load_stocks_to_use(code)
+    this_my = stocks_use.marketing_year(code, near_expiry)
+    # Each overlaid year rolls the contract back a year, so its marketing year rolls back with
+    # it by the same offset.
+    offset = near_expiry.year - this_my
+    my_label = stocks_use.marketing_year_label(this_my)
+    all_similar = stocks_use.similar_years(stu, this_my, similar_tol)
+    # PSD reaches back decades, but only years actually overlaid can be bolded.
+    similar = [y + offset for y in all_similar if y + offset in candidate_years]
+    beyond = len(all_similar) - len(similar)
+    if not stu:
+        st.caption("Stocks/use data unavailable right now.")
+    elif this_my not in stu:
+        st.caption(f"USDA hasn't published a {my_label} balance sheet yet, so there's nothing to "
+                   "match against.")
+    elif not similar:
+        st.caption(f"{my_label} is {stu[this_my]:{ratio_fmt}}% S/U · no overlaid year within "
+                   f"±{similar_tol:g} pts."
+                   + (f" {beyond} match further back — raise *Prior years*." if beyond else ""))
+    else:
+        st.caption(
+            f"{my_label} is {stu[this_my]:{ratio_fmt}}% S/U · similar: "
+            + ", ".join(f"{stocks_use.marketing_year_label(y - offset)} "
+                        f"({stu[y - offset]:{ratio_fmt}}%)" for y in sorted(similar))
+            + (f" · {beyond} more further back" if beyond else ""))
+    return similar
+
+
 def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     code = commodity["product_code"]
     key = commodity["key"]
@@ -554,6 +627,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
     window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
     anchor_expiry = expiries[ticker]
     label = friendly_contract(ticker, code)
+    highlight_years = similar_su_controls(
+        code, f"fut_{key}", [anchor_expiry.year - b for b in range(years_back + 1)], anchor_expiry)
     y_title = "Index (start = 100)" if indexed else f"Price ({unit})"
     fmt = ".1f" if indexed else ".2f"
 
@@ -619,10 +694,12 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
         xs_dte = [dte[i] for i in keep]
         xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
         name = t + (" (current)" if back == 0 else "")
+        is_highlighted = base_year - back in highlight_years
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=name,
-            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
-            opacity=1.0 if back == 0 else 0.75,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)],
+                      width=3 if back == 0 else (2.5 if is_highlighted else 1.5)),
+            opacity=1.0 if (back == 0 or is_highlighted) else (0.3 if highlight_years else 0.75),
             hovertemplate=f"{name}<br>%{{y:{fmt}}}<extra></extra>",
         ))
         by_dte[t] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
@@ -736,10 +813,13 @@ def render_leg_picker(curves: dict[str, pd.DataFrame], state_key: str,
 def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: date,
                          expiries_by_product: dict[str, dict[str, date]], years_back: int,
                          seasonal_line: str, window_label: str, unit: str,
-                         report_dates: dict | None, key: str):
+                         report_dates: dict | None, key: str,
+                         highlight_years: list[int] | None = None):
     """Shared recent-history + seasonal-overlay rendering for both the
     per-commodity calendar spread (fixed product_code across legs) and the
-    cross-commodity spread builder (each leg its own product_code)."""
+    cross-commodity spread builder (each leg its own product_code).
+    `highlight_years` are leg 1's contract years to draw heavier, the rest fading back."""
+    highlight_years = highlight_years or []
     window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
     label = _spread_label(legs)
     y_title = f"Spread ({unit})"
@@ -767,6 +847,7 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
 
     resolved: dict[str, pd.Series] = {}
     year_legsets: list[list[tuple[str, str, int]]] = []
+    year_backs: list[int] = []   # how many years back each entry of year_legsets is
     for back in range(years_back + 1):
         legset = []
         ok = True
@@ -779,6 +860,7 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
             legset.append((code, t_label, sign))
         if ok:
             year_legsets.append(legset)
+            year_backs.append(back)
 
     st.caption(f"**{label}** — recent history")
     current_series = _combine_series(resolved, year_legsets[0]) if year_legsets else None
@@ -809,7 +891,7 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
     by_dte: dict[str, pd.Series] = {}
     skipped: list[str] = []
 
-    for back, legset in enumerate(year_legsets):
+    for back, legset in zip(year_backs, year_legsets):
         spread = _combine_series(resolved, legset)
         if spread is None:
             skipped.append(_spread_label(legset))
@@ -826,10 +908,12 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
         xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
         ys = [spread.values[i] for i in keep]
         name = _spread_label(legset) + (" (current)" if back == 0 else "")
+        is_highlighted = base_years[(anchor_code, anchor_ticker)] - back in highlight_years
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=name,
-            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
-            opacity=1.0 if back == 0 else 0.75,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)],
+                      width=3 if back == 0 else (2.5 if is_highlighted else 1.5)),
+            opacity=1.0 if (back == 0 or is_highlighted) else (0.3 if highlight_years else 0.75),
             hovertemplate=f"{name}<br>%{{y:+.2f}}<extra></extra>",
         ))
         by_dte[_spread_label(legset)] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
@@ -882,8 +966,14 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date, report_da
         return
 
     expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    near_expiry = expiries.get(legs[0][1])
+    highlight_years = []
+    if near_expiry is not None:
+        highlight_years = similar_su_controls(
+            code, f"sp_{key}", [near_expiry.year - b for b in range(years_back + 1)], near_expiry)
     render_spread_charts(legs, api_key, as_of, {code: expiries}, years_back, seasonal_line or "Average",
-                         window_label, unit, report_dates, key=f"{key}_{'_'.join(t for _, t, _ in legs)}")
+                         window_label, unit, report_dates, key=f"{key}_{'_'.join(t for _, t, _ in legs)}",
+                         highlight_years=highlight_years)
 
 
 def build_spread_matrix(curve: pd.DataFrame, code: str) -> tuple[pd.DataFrame, list[str]]:
