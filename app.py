@@ -1,6 +1,8 @@
 import base64
 import os
+import re
 from datetime import date, datetime, timedelta
+from html import unescape
 from pathlib import Path
 
 import anthropic
@@ -12,6 +14,7 @@ from plotly.subplots import make_subplots
 
 import brazil_board
 import brazil_card
+import png_disclaimer
 import seasonal_pattern
 import settlement_bank
 import stocks_use
@@ -266,7 +269,8 @@ def export_row(frame: pd.DataFrame, filename: str, key: str, fig=None, table: di
         if table is not None:
             wm = watermark_path()
             table_png_button(table["styler"], filename, key, table.get("title", ""),
-                             table.get("note", ""), watermark_uri=watermark_uri(wm) if wm else None)
+                             table.get("note", ""), watermark_uri=watermark_uri(wm) if wm else None,
+                             disclaimer=disclaimer_text())
         if extra is not None:
             extra()
         if fig is not None:
@@ -2296,6 +2300,12 @@ def render_disclaimer_footer():
     st.markdown(DISCLAIMER_FOOTER_HTML.format(year=datetime.now().year), unsafe_allow_html=True)
 
 
+def disclaimer_text() -> str:
+    """The footer's wording as plain text, for the images that leave the app."""
+    plain = unescape(re.sub(r"<[^>]*>", "", DISCLAIMER_FOOTER_HTML))
+    return plain.format(year=datetime.now().year)
+
+
 def main():
     col_logo, col_title = st.columns([1, 6], vertical_alignment="center")
     with col_logo:
@@ -2384,6 +2394,8 @@ def main():
             render_hl_tab(api_key, load_legacy_history_cached())
 
     render_disclaimer_footer()
+    # The same wording goes inside chart images saved from the camera icon.
+    png_disclaimer.install(disclaimer_text())
 
 
 if __name__ == "__main__":
