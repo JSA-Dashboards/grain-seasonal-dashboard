@@ -383,7 +383,7 @@ def _build_display_table(df, ratio_col, ratio_label, current_ratio, current_jan1
     d = _rank_df(df, ratio_col, current_ratio, current_jan1)
     if d.empty:
         return pd.DataFrame()
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=d.index)   # ranks 1..n: columns assigned below must line up with them
     out["Rank"] = d.index
     out["Year"] = d["year"].astype(int)
     if "section" in d.columns:
