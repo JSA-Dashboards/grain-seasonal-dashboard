@@ -120,7 +120,10 @@ def grain_fnd(expiration: date) -> date:
 
 @lru_cache(maxsize=None)
 def _exchange_closures(year: int) -> frozenset:
-    import holidays  # here, not at the top, so a missing package can only affect the matrix
+    try:
+        import holidays
+    except ImportError:  # until the new requirements install: weekends only, as the FND itself is
+        return frozenset()
     # NYSE's calendar matches CBOT grain closures (incl. Good Friday and Juneteenth).
     return frozenset(holidays.financial_holidays("NYSE", years=year))
 
@@ -141,6 +144,8 @@ def matrix_rotation_date(expiration: date) -> date:
 
 def rotate_curve(curve: pd.DataFrame, as_of: date, keep: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(the first `keep` contracts that haven't rotated out, the ones that have)."""
+    if curve.empty:  # get_futures_curve returns a column-less frame when nothing is priced
+        return curve, curve
     done = curve["expiration"].map(lambda e: as_of >= matrix_rotation_date(e))
     return curve[~done].head(keep).reset_index(drop=True), curve[done]
 
