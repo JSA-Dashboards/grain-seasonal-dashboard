@@ -1,6 +1,7 @@
 import base64
 import os
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 import anthropic
@@ -115,6 +116,33 @@ def grain_fnd(expiration: date) -> date:
     physically delivered, unlike CME livestock (cash-settled, no FND)."""
     first_of_delivery_month = pd.Timestamp(year=expiration.year, month=expiration.month, day=1)
     return (first_of_delivery_month - pd.offsets.BDay(1)).date()
+
+
+@lru_cache(maxsize=None)
+def _exchange_closures(year: int) -> frozenset:
+    import holidays  # here, not at the top, so a missing package can only affect the matrix
+    # NYSE's calendar matches CBOT grain closures (incl. Good Friday and Juneteenth).
+    return frozenset(holidays.financial_holidays("NYSE", years=year))
+
+
+MATRIX_ROTATION_BDAYS = 5
+
+
+def matrix_rotation_date(expiration: date) -> date:
+    """The day a contract leaves the spread matrix: five business days after its First
+    Notice Day, counted on the exchange calendar so a holiday in between pushes it out."""
+    day, left = grain_fnd(expiration), MATRIX_ROTATION_BDAYS
+    while left:
+        day += timedelta(days=1)
+        if day.weekday() < 5 and day not in _exchange_closures(day.year):
+            left -= 1
+    return day
+
+
+def rotate_curve(curve: pd.DataFrame, as_of: date, keep: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(the first `keep` contracts that haven't rotated out, the ones that have)."""
+    done = curve["expiration"].map(lambda e: as_of >= matrix_rotation_date(e))
+    return curve[~done].head(keep).reset_index(drop=True), curve[done]
 
 
 def get_api_key() -> str:
@@ -1262,13 +1290,21 @@ def render_spread_matrix(commodity: dict, api_key: str, as_of: date):
     n_load = st.slider("Contract months", 3, 10, 10, key=f"mx_months_{key}", width=200)
 
     try:
-        curve = load_curve(code, api_key, as_of.isoformat(), n_load)
+        # One spare month, so the matrix keeps n_load contracts once the front one has rotated out.
+        curve = load_curve(code, api_key, as_of.isoformat(), n_load + 1)
     except MassiveApiError as e:
         st.error(f"Couldn't load {commodity['label']} quotes: {e}")
         return
+    curve, rotated = rotate_curve(curve, as_of, n_load)
     if curve.empty or len(curve) < 2:
         st.warning("Not enough live contracts to build a matrix.")
         return
+    if len(rotated):
+        gone = "; ".join(
+            f"{friendly_contract(r.ticker, code)} on {matrix_rotation_date(r.expiration):%b %d} "
+            f"(First Notice Day {grain_fnd(r.expiration):%b %d})"
+            for r in rotated.itertuples())
+        st.caption(f"Rotated out of the matrix, five business days after First Notice Day: {gone}.")
 
     frame, labels = build_spread_matrix(curve, code)
     display = frame.copy()
