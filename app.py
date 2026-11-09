@@ -1744,7 +1744,7 @@ def render_ask_ai(api_key: str, anthropic_key: str, as_of: date,
 
 
 # ── Trends snapshot ──────────────────────────────────────────────────────────
-TREND_CONTRACTS = 3        # ask for three, so a front month without a price doesn't leave one short
+TREND_CONTRACTS = 4        # ask for four: the nearest may be past its first notice day and dropped, and one more is a spare for a month without a price
 MASSIVE_FLOOR = date(2021, 9, 2)   # Massive's first daily bar (see DATA_START_NOTE)
 BANK_FIRST_YEAR = 2021     # earliest contract year in the Snowflake settlement bank
 BANK_FRESH_DAYS = 4        # a front month's banked history more than this far behind (a missed job) comes from Massive instead
@@ -1850,15 +1850,31 @@ def settled_before(series: "pd.Series | None", as_of: date) -> "pd.Series | None
     return series[[day < as_of for day in series.index]]
 
 
+def drop_past_first_notice(curve: pd.DataFrame, as_of: date) -> pd.DataFrame:
+    """The curve without the contracts that are past their first notice day, nearest first.
+    A contract is the front month through its first notice day and drops out the day after,
+    about two weeks before it expires, so the snapshot moves on while Massive still lists it."""
+    keep = [as_of <= grain_fnd(expiration) for expiration in curve["expiration"]]
+    return curve[keep].reset_index(drop=True)
+
+
 def load_trend_fronts(api_key: str, as_of: date, bank: dict) -> list[dict]:
-    """The two nearest contracts of every market, with live price and settlement history. A
-    market that couldn't be loaded appears once, carrying its error. History comes from the
-    settlement bank while it is current for that contract (a weekend or holiday is fine; a
-    missed job isn't), and from Massive otherwise."""
+    """The two nearest contracts of every market that are not past their first notice day, with
+    live price and settlement history. A market that couldn't be loaded appears once, carrying
+    its error. History comes from the settlement bank while it is current for that contract (a
+    weekend or holiday is fine; a missed job isn't), and from Massive otherwise."""
     iso = as_of.isoformat()
     curves, errors = load_trend_curves(api_key, iso)
-    fronts = {c["product_code"]: curves[c["product_code"]].head(2)
-              for c in COMMODITIES if c["product_code"] in curves}
+    fronts: dict[str, pd.DataFrame] = {}
+    for c in COMMODITIES:
+        code = c["product_code"]
+        if code not in curves:
+            continue
+        live = drop_past_first_notice(curves[code], as_of)
+        if live.empty:
+            errors[code] = "every listed contract is past its first notice day"
+        else:
+            fronts[code] = live.head(2)
     histories: dict[str, pd.Series] = {}
     unbanked: list[str] = []
     for code, curve in fronts.items():
@@ -2058,7 +2074,8 @@ TREND_PNG_NOTE = (
     f"{DELAYED_QUOTES_NOTE} Changes are against the same contract's settlement a week, a month "
     "and a year earlier. Averages are the last 20, 100 and 200 daily settlements before today. "
     "Seasonal is the average move of the same contract month over the same 30 days in prior "
-    "years (up to 15): Higher at +3% or more, Weaker at -3% or less, Neutral between."
+    "years (up to 15): Higher at +3% or more, Weaker at -3% or less, Neutral between. A month "
+    "is shown through its first notice day and rolls to the next one the day after."
 )
 
 
@@ -2100,7 +2117,8 @@ def render_trends(api_key: str, as_of: date):
     st.caption(
         "The two front months of each market: where they trade against a week, a month and a "
         "year ago, their 20, 100 and 200-day averages, and what the seasonal says about the "
-        "next 30 days."
+        "next 30 days. A month is shown through its first notice day and rolls to the next "
+        "one the day after."
     )
     st.caption(DELAYED_QUOTES_NOTE)
     render_trend_legend()
